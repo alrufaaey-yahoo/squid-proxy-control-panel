@@ -48,7 +48,6 @@ python3 -m venv "$APP_DIR/.venv"
 
 install -o root -g root -m 0755 "$APP_DIR/scripts/squid-panel-helper" /usr/local/sbin/squid-panel-helper
 cat > /etc/sudoers.d/squid-panel <<'SUDOERS'
-Defaults:squid-panel !requiretty
 squid-panel ALL=(root) NOPASSWD: /usr/local/sbin/squid-panel-helper status, /usr/local/sbin/squid-panel-helper logs, /usr/local/sbin/squid-panel-helper apply, /usr/local/sbin/squid-panel-helper restart
 SUDOERS
 chmod 0440 /etc/sudoers.d/squid-panel
