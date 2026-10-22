@@ -14,7 +14,11 @@ info() { echo "[Squid Panel] $*"; }
 [[ -f "$SOURCE_DIR/squid_panel/__init__.py" ]] || fail "شغّل المثبت من مجلد المستودع الكامل."
 command -v apt-get >/dev/null || fail "يدعم المثبت Ubuntu وDebian اللذين يستخدمان apt فقط."
 command -v systemctl >/dev/null || fail "يتطلب المثبت systemd."
-[[ ! -e "$DATA_DIR/panel.sqlite3" ]] || fail "يوجد تثبيت سابق. استخدم دليل الترقية قبل إعادة التثبيت؛ لن يتم استبدال بياناتك."
+if [[ -e "$DATA_DIR/panel.sqlite3" ]]; then
+  echo "وُجدت قاعدة بيانات سابقة. سيحافظ المثبت على مستخدمي Squid وسياساته، لكنه سيحدّث منفذ اللوحة ويعيد تعيين دخول المدير بالبيانات التي ستدخلها الآن."
+  read -r -p "هل تريد متابعة استكمال/تحديث التثبيت؟ [y/N]: " RESUME_INSTALL
+  [[ "${RESUME_INSTALL,,}" == "y" || "${RESUME_INSTALL,,}" == "yes" ]] || fail "أُلغي التثبيت دون تعديل قاعدة البيانات."
+fi
 
 read -r -p "منفذ لوحة التحكم (1024-65535، الافتراضي 8080): " PANEL_PORT
 PANEL_PORT="${PANEL_PORT:-8080}"
@@ -27,6 +31,7 @@ info "تثبيت الحزم المطلوبة..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y squid apache2-utils python3 python3-venv sudo ca-certificates openssl
+systemctl stop squid-panel 2>/dev/null || true
 systemctl stop squid || true
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -65,6 +70,7 @@ chmod 0640 "$ETC_DIR/panel.env"
 
 info "تهيئة مدير اللوحة. لن تظهر كلمة المرور أثناء كتابتها."
 cd "$APP_DIR"
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$DATA_DIR"
 sudo -u "$SERVICE_USER" env SQUID_PANEL_DB="$DATA_DIR/panel.sqlite3" "$APP_DIR/.venv/bin/python" -m squid_panel.setup --admin-user "$ADMIN_USER" --panel-port "$PANEL_PORT" --database "$DATA_DIR/panel.sqlite3"
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$DATA_DIR"
 chmod 0640 "$DATA_DIR/panel.sqlite3"

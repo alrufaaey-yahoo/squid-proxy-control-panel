@@ -6,9 +6,38 @@ import sys
 from werkzeug.security import generate_password_hash
 from .db import init_db
 
+DEFAULT_SETTINGS = {
+    "proxy_port": "3128",
+    "safe_ports": "80,443",
+    "ssl_ports": "443",
+    "allowed_domains": "",
+    "allowed_clients": "",
+}
+
+
+def persist_admin(database, username, password_hash, panel_port):
+    """Create/update panel credentials while preserving proxy users and policy."""
+    db = sqlite3.connect(database)
+    admin_values = {
+        "admin_username": username,
+        "admin_password_hash": password_hash,
+        "panel_port": str(panel_port),
+    }
+    db.executemany(
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        admin_values.items(),
+    )
+    db.executemany(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+        DEFAULT_SETTINGS.items(),
+    )
+    db.commit()
+    db.close()
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Initialize the Squid Proxy Panel administrator")
+    parser = argparse.ArgumentParser(description="Initialize or update the Squid Proxy Panel administrator")
     parser.add_argument("--admin-user", required=True)
     parser.add_argument("--panel-port", type=int, required=True)
     parser.add_argument("--database", default=os.environ.get("SQUID_PANEL_DB", "/var/lib/squid-panel/panel.sqlite3"))
@@ -24,21 +53,8 @@ def main():
     if len(password) < 12 or len(password) > 128 or password != confirm:
         print("كلمة المرور غير مطابقة أو أقصر من 12 محرفًا.", file=sys.stderr)
         return 2
-    db = sqlite3.connect(args.database)
-    values = {
-        "admin_username": args.admin_user,
-        "admin_password_hash": generate_password_hash(password),
-        "panel_port": str(args.panel_port),
-        "proxy_port": "3128",
-        "safe_ports": "80,443",
-        "ssl_ports": "443",
-        "allowed_domains": "",
-        "allowed_clients": "",
-    }
-    db.executemany("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", values.items())
-    db.commit()
-    db.close()
-    print("تم إنشاء حساب مدير اللوحة والإعدادات الأولية.")
+    persist_admin(args.database, args.admin_user, generate_password_hash(password), args.panel_port)
+    print("تم حفظ حساب مدير اللوحة مع الإبقاء على مستخدمي وإعدادات Squid الحالية.")
     return 0
 
 
