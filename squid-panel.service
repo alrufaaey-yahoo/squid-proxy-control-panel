@@ -1,0 +1,26 @@
+[Unit]
+Description=Squid Proxy Management Panel
+After=network-online.target squid.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=squid-panel
+Group=squid-panel
+WorkingDirectory=/opt/squid-proxy-panel
+EnvironmentFile=/etc/squid-panel/panel.env
+ExecStart=/opt/squid-proxy-panel/.venv/bin/gunicorn --workers 2 --bind 0.0.0.0:${PANEL_PORT} --access-logfile - --error-logfile - squid_panel:create_app()
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/squid-panel /etc/squid /var/log/squid /var/spool/squid
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

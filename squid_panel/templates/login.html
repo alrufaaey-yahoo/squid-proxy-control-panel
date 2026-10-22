@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>تسجيل الدخول · Squid Panel</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="brand-mark">SP</div>
+    <p class="eyebrow">إدارة الخادم</p>
+    <h1>Squid Proxy Panel</h1>
+    <p class="muted">سجّل الدخول لمتابعة إعدادات الوكيل.</p>
+    {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="notice {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+    <form method="post" action="{{ url_for('login') }}" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>اسم المستخدم<input name="username" autocomplete="username" required maxlength="64" autofocus></label>
+      <label>كلمة المرور<input type="password" name="password" autocomplete="current-password" required maxlength="128"></label>
+      <button class="button primary full" type="submit">دخول آمن</button>
+    </form>
+    <p class="small muted center">استخدم بيانات المدير التي أنشأتها أثناء التثبيت.</p>
+  </main>
+</body>
+</html>

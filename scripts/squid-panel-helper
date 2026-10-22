@@ -1,0 +1,233 @@
+#!/usr/bin/python3
+"""Root-owned, allowlisted operations for the Squid Proxy Panel."""
+import ipaddress
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+DB = "/var/lib/squid-panel/panel.sqlite3"
+SQUID_CONF = "/etc/squid/squid.conf"
+PASSWD = "/etc/squid/passwd"
+HELPER = "/usr/lib/squid/basic_ncsa_auth"
+VALID_USER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
+BCRYPT = re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$")
+
+
+def run(argv, timeout=20):
+    try:
+        proc = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
+    return proc.returncode, proc.stdout[-10000:]
+
+
+def load_state():
+    if not os.path.isfile(DB) or os.path.islink(DB):
+        raise RuntimeError("Panel database not found or invalid")
+    db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    settings = {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM settings")}
+    users = list(db.execute("SELECT username,password_hash FROM proxy_users ORDER BY username"))
+    db.close()
+    return settings, users
+
+
+def port_list(value, fallback):
+    text = str(value or fallback)
+    values = text.split(",")
+    if not values or any(not item.isdigit() for item in values):
+        raise RuntimeError("Invalid port list")
+    ports = sorted(set(int(item) for item in values))
+    if any(p < 1 or p > 65535 for p in ports):
+        raise RuntimeError("Port out of range")
+    return ports
+
+
+def render(settings, users):
+    try:
+        port = int(settings.get("proxy_port", "3128"))
+        panel_port = int(settings.get("panel_port", "8080"))
+    except ValueError as exc:
+        raise RuntimeError("Invalid listener port") from exc
+    if not (1024 <= port <= 65535) or port == panel_port:
+        raise RuntimeError("Invalid or conflicting Squid listener port")
+    safe_ports = port_list(settings.get("safe_ports"), "80,443")
+    ssl_ports = port_list(settings.get("ssl_ports"), "443")
+    if not set(ssl_ports).issubset(set(safe_ports)):
+        raise RuntimeError("CONNECT ports must be a subset of allowed ports")
+
+    domains = []
+    for value in settings.get("allowed_domains", "").splitlines():
+        value = value.strip().lower()
+        if not value or value.startswith("#"):
+            continue
+        if (len(value) > 253 or not re.fullmatch(r"\.?[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", value)
+                or ".." in value or "*" in value):
+            raise RuntimeError("Invalid destination domain")
+        domains.append(value)
+    networks = []
+    for value in settings.get("allowed_clients", "").splitlines():
+        value = value.strip()
+        if not value or value.startswith("#"):
+            continue
+        try:
+            networks.append(str(ipaddress.ip_network(value, strict=False)))
+        except ValueError as exc:
+            raise RuntimeError("Invalid client IP/CIDR") from exc
+    domains = sorted(set(domains))
+    networks = sorted(set(networks))
+
+    normalized = []
+    for row in users:
+        username, password_hash = row["username"], row["password_hash"]
+        if not VALID_USER.fullmatch(username) or username in {".", ".."}:
+            raise RuntimeError("Invalid proxy account name")
+        if not BCRYPT.fullmatch(password_hash):
+            raise RuntimeError("Invalid or unsupported password hash")
+        normalized.append((username, password_hash))
+
+    lines = [
+        "# Managed by squid-proxy-panel; local changes will be overwritten.",
+        f"http_port 0.0.0.0:{port}",
+        "visible_hostname squid-proxy-panel",
+        "cache deny all",
+        "access_log stdio:/var/log/squid/access.log squid",
+        "coredump_dir /var/spool/squid",
+        "shutdown_lifetime 3 seconds",
+        "acl Safe_ports port " + " ".join(map(str, safe_ports)),
+        "acl SSL_ports port " + " ".join(map(str, ssl_ports)),
+        "http_access deny !Safe_ports",
+        "http_access deny CONNECT !SSL_ports",
+        "acl manager proto cache_object",
+        "http_access allow localhost manager",
+        "http_access deny manager",
+        "acl to_localhost dst 127.0.0.0/8 ::1",
+        "acl to_linklocal dst 169.254.0.0/16 fe80::/10",
+        "acl to_private_network dst 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7",
+        "http_access deny to_localhost",
+        "http_access deny to_linklocal",
+        "http_access deny to_private_network",
+    ]
+    if normalized:
+        if not os.path.isfile(HELPER):
+            raise RuntimeError("Squid basic_ncsa_auth helper not found")
+        lines.extend([
+            f"auth_param basic program {HELPER} {PASSWD}",
+            "auth_param basic children 10 startup=5 idle=1",
+            "auth_param basic realm Squid Proxy",
+            "auth_param basic credentialsttl 2 hours",
+            "acl authenticated proxy_auth REQUIRED",
+        ])
+        if networks:
+            lines.append("acl trusted_clients src " + " ".join(networks))
+        if domains:
+            lines.append("acl allowed_domains dstdomain " + " ".join(domains))
+        conditions = ["authenticated"]
+        if networks:
+            conditions.append("trusted_clients")
+        if domains:
+            conditions.append("allowed_domains")
+        lines.append("http_access allow " + " ".join(conditions))
+    else:
+        # The fresh installation stays closed until the first proxy user is added.
+        lines.append("http_access deny all")
+    lines.append("http_access deny all")
+    return "\n".join(lines) + "\n", "".join(f"{username}:{password_hash}\n" for username, password_hash in normalized)
+
+
+def atomic_file(path, data, mode, owner_uid=0, owner_gid=0):
+    parent = os.path.dirname(path)
+    fd, temp_path = tempfile.mkstemp(prefix=".squid-panel-", dir=parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp_path, mode)
+        os.chown(temp_path, owner_uid, owner_gid)
+        os.replace(temp_path, path)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def apply():
+    if os.geteuid() != 0:
+        return 1, "This operation requires root"
+    settings, users = load_state()
+    config, passwd = render(settings, users)
+    os.makedirs("/etc/squid", mode=0o755, exist_ok=True)
+    try:
+        gid = __import__("grp").getgrnam("proxy").gr_gid
+    except KeyError:
+        gid = 0
+    fd, candidate = tempfile.mkstemp(prefix="squid-panel-check-", dir="/etc/squid", text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(config)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(candidate, 0o640)
+        code, output = run(["/usr/sbin/squid", "-k", "parse", "-f", candidate], timeout=30)
+        if code != 0:
+            return code, "Squid config validation failed:\n" + output
+    finally:
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+
+    old_config = open(SQUID_CONF, "rb").read() if os.path.isfile(SQUID_CONF) else None
+    atomic_file(PASSWD, passwd, 0o640, 0, gid)
+    try:
+        atomic_file(SQUID_CONF, config, 0o640, 0, 0)
+    except Exception:
+        run(["/bin/systemctl", "stop", "squid"], timeout=30)
+        raise
+    code, output = run(["/bin/systemctl", "restart", "squid"], timeout=30)
+    if code:
+        restore_note = ""
+        try:
+            if old_config is not None:
+                atomic_file(SQUID_CONF, old_config.decode("utf-8", "replace"), 0o640, 0, 0)
+        except Exception as exc:
+            restore_note = f" Previous config restore failed: {exc}."
+        stop_code, stop_output = run(["/bin/systemctl", "stop", "squid"], timeout=30)
+        stopped = "Squid stopped to fail closed." if stop_code == 0 else "WARNING: Squid stop also failed: " + stop_output
+        return code, "Squid restart failed; previous configuration restore attempted." + restore_note + " " + stopped + "\n" + output
+    return 0, "Squid configuration applied and service restarted."
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: squid-panel-helper {status|logs|apply|restart}", file=sys.stderr)
+        return 2
+    action = sys.argv[1]
+    if action == "status":
+        code, output = run(["/bin/systemctl", "status", "squid", "--no-pager", "--full"], timeout=10)
+    elif action == "logs":
+        code, output = run(["/usr/bin/tail", "-n", "120", "/var/log/squid/access.log"], timeout=10)
+        if code and os.path.exists("/var/log/squid/cache.log"):
+            code, output = run(["/usr/bin/tail", "-n", "120", "/var/log/squid/cache.log"], timeout=10)
+    elif action == "restart":
+        code, output = run(["/bin/systemctl", "restart", "squid"], timeout=30)
+    elif action == "apply":
+        try:
+            code, output = apply()
+        except Exception as exc:
+            code, output = 1, f"Apply failed: {type(exc).__name__}: {exc}"
+    else:
+        print("Operation not allowed", file=sys.stderr)
+        return 2
+    if output:
+        print(output.rstrip())
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
